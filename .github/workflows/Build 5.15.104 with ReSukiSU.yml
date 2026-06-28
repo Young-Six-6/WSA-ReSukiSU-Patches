@@ -20,7 +20,7 @@ env:
   KERNEL_TAG: android-lts/latte-2/5.15.104.4
   PATCH_REPO: Young-Six-6/WSA-ReSukiSU-Patches
   PATCH_BRANCH: main
-  PATCH_DIR: 5.10.104
+  PATCH_DIR: 5.15.104
 
 jobs:
   build:
