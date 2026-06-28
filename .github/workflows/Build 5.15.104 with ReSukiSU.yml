@@ -75,7 +75,7 @@ jobs:
           for patch_file in "$PATCH_ABS_DIR"/00*.patch; do
             patch_name=$(basename "$patch_file")
             echo "Validating: $patch_name"
-            if ! patch -p1 --dry-run --no-backup-if-mismatch -i "$patch_file"; then
+            if ! patch -p0 --dry-run --no-backup-if-mismatch -i "$patch_file"; then
               echo "Error VALIDATION FAILED: $patch_name has conflicts / rejects"
               exit 1
             fi
@@ -86,7 +86,7 @@ jobs:
           for patch_file in "$PATCH_ABS_DIR"/00*.patch; do
             patch_name=$(basename "$patch_file")
             echo "Applying: $patch_name"
-            patch -p1 --no-backup-if-mismatch -i "$patch_file"
+            patch -p0 --no-backup-if-mismatch -i "$patch_file"
           done
 
           echo ""

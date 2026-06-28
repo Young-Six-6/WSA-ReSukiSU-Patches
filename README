@@ -1,0 +1,7 @@
+WSA-ReSukiSU-Patches
+
+提供为WSA进行的ResukiSU需要的手动钩子，以patch文件的形式提供
+
+提供workflow用于自动构建预构建内核，自动拉取新版ResukiSU
+
+
