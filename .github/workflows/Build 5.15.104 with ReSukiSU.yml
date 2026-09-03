@@ -18,9 +18,11 @@ on:
 
 env:
   KERNEL_TAG: android-lts/latte-2/5.15.104.4
-  PATCH_REPO: Young-Six-6/WSA-ReSukiSU-Patches
-  PATCH_BRANCH: main
+  PATCH_REPO: ${{ github.repository }}
+  PATCH_BRANCH: ${{ github.ref_name }}
   PATCH_DIR: 5.15.104
+  KSU_REPO: ReSukiSU/ReSukiSU
+  KSU_REF: 736d9fe8a66c18908e67cfaa4abf82c4326308aa
 
 jobs:
   build:
@@ -94,7 +96,13 @@ jobs:
 
       - name: Integrate ReSukiSU
         run: |
-          curl -LSs https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh | bash
+          curl -LSs https://raw.githubusercontent.com/${{ env.KSU_REPO }}/${{ env.KSU_REF }}/kernel/setup.sh | bash -s -- "${{ env.KSU_REF }}"
+
+      - name: Apply WSA ReSukiSU compatibility patch
+        run: |
+          PATCH_FILE="$(realpath "../patch-repo/${{ env.PATCH_DIR }}/resukisu/0001-wsa-manual-hook-compat.patch")"
+          patch --batch --directory=KernelSU -p1 --dry-run --no-backup-if-mismatch -i "$PATCH_FILE"
+          patch --batch --directory=KernelSU -p1 --no-backup-if-mismatch -i "$PATCH_FILE"
 
       - name: Configure kernel
         run: |

@@ -1,0 +1,361 @@
+diff --git a/kernel/core/init.c b/kernel/core/init.c
+index 9be1c15b..f08856db 100644
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -185,7 +185,7 @@ int __init kernelsu_init(void)
+ #endif
+ 
+     // If we are in tracepoint hook, and won't enable PATCH_SYSCALL_DISPATCHER, check x86-64 hooks
+-#if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
++#if defined(CONFIG_KSU_TRACEPOINT_HOOK) && defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
+     // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set
+     if (!boot_cpu_has(X86_FEATURE_INDIRECT_SAFE)) {
+         pr_alert("*************************************************************");
+diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
+index 4fd64343..e2d78908 100644
+--- a/kernel/feature/sucompat.c
++++ b/kernel/feature/sucompat.c
+@@ -43,6 +43,7 @@
+ #include "ksu.h"
+ 
+ #define SU_PATH "/system/bin/su"
++#define SU_ALT_PATH "/product/bin/su"
+ #define SH_PATH "/system/bin/sh"
+ 
+ #ifdef KSU_COMPAT_USE_STATIC_KEY
+@@ -119,9 +120,49 @@ static void __user *userspace_stack_buffer(const void *d, size_t len)
+ #endif
+ 
+ static const char su_path[] = SU_PATH;
++static const char su_alt_path[] = SU_ALT_PATH;
+ static const char sh_path[] = SH_PATH;
++
++static bool is_su_path(const char *path)
++{
++    return !memcmp(path, su_path, sizeof(su_path)) ||
++           !memcmp(path, su_alt_path, sizeof(su_alt_path));
++}
+ static const char ksud_path[] = KSUD_PATH;
+ 
++static bool ksu_sucompat_should_handle_path(const char *path)
++{
++#ifdef KSU_COMPAT_USE_STATIC_KEY
++    if (!static_branch_unlikely(&ksu_su_compat_enabled))
++        return false;
++#else
++    if (!ksu_su_compat_enabled)
++        return false;
++#endif
++
++    if (!path || !is_su_path(path))
++        return false;
++
++    if (!ksu_is_allow_uid_for_current(ksu_get_uid_t(current_uid())))
++        return false;
++
++    return true;
++}
++
++const char *ksu_sucompat_lookup_redirect(const char *path)
++{
++    if (!ksu_sucompat_should_handle_path(path))
++        return NULL;
++
++    /*
++     * WSA terminal runtimes require pathname lookup to succeed before they
++     * issue execve. Resolve only that lookup to a harmless existing file.
++     * The original filename is restored by filename_lookup(), so execve still
++     * reaches the normal sucompat path and is replaced with ksud.
++     */
++    return sh_path;
++}
++
+ static char __user *ksud_user_path(void)
+ {
+     return userspace_stack_buffer(ksud_path, sizeof(ksud_path));
+@@ -167,11 +208,11 @@ long ksu_handle_faccessat_sucompat_internal(int orig_nr, struct pt_regs *regs)
+ 
+     filename_user = (const char __user **)&PT_REGS_PARM2(regs);
+ 
+-    char path[sizeof(su_path) + 1];
++    char path[sizeof(su_alt_path) + 1];
+     memset(path, 0, sizeof(path));
+     strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+ 
+-    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
++    if (unlikely(is_su_path(path))) {
+         old_cred = override_creds(ksu_cred);
+         if (is_ksud_exists()) {
+             pr_info("faccessat su->ksud!\n");
+@@ -202,11 +243,11 @@ long ksu_handle_stat_sucompat_internal(int orig_nr, struct pt_regs *regs)
+ 
+     filename_user = (const char __user **)&PT_REGS_PARM2(regs);
+ 
+-    char path[sizeof(su_path) + 1];
++    char path[sizeof(su_alt_path) + 1];
+     memset(path, 0, sizeof(path));
+     strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+ 
+-    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
++    if (unlikely(is_su_path(path))) {
+         old_cred = override_creds(ksu_cred);
+         if (is_ksud_exists()) {
+             pr_info("newfstatat su->ksud!\n");
+@@ -232,7 +273,7 @@ static long ksu_handle_execve_sucompat_common_internal(const char __user **filen
+ {
+     const char __user *fn;
+     struct ksu_sulog_pending_event *pending_sucompat = NULL;
+-    char path[sizeof(su_path) + 1];
++    char path[sizeof(su_alt_path) + 1];
+     long ret, orig_regs[5];
+     unsigned long addr;
+     int tmp_fd;
+@@ -259,7 +300,7 @@ static long ksu_handle_execve_sucompat_common_internal(const char __user **filen
+         goto do_orig_execve;
+     }
+ 
+-    if (likely(memcmp(path, su_path, sizeof(su_path))))
++    if (likely(!is_su_path(path)))
+         goto do_orig_execve;
+ 
+     pr_info("sys_execve su found\n");
+@@ -337,6 +378,7 @@ static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename,
+ {
+     struct ksu_sulog_pending_event *pending_sucompat = NULL;
+     struct path kpath;
++    int ret;
+     bool is_allowed = ksu_is_allow_uid_for_current(ksu_get_uid_t(current_uid()));
+ 
+ #ifdef KSU_COMPAT_USE_STATIC_KEY
+@@ -354,19 +396,16 @@ static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename,
+     if (!is_allowed)
+         return 0;
+ 
+-    if (likely(memcmp(filename, su_path, sizeof(su_path))))
++    if (likely(!is_su_path(filename)))
+         return 0;
+ 
+-    pr_info("do_execveat_common su found\n");
+ 
+-    escape_with_root_profile();
++    ret = escape_with_root_profile();
+ 
+     pending_sucompat = ksu_sulog_capture_sucompat_manual(filename, *argv, GFP_KERNEL);
+ 
+-    // We are only check ksud exists
+-    // In manual hook, we can't try exec ksud, and detect exec success or not
+-    if (kern_path(KSUD_PATH, LOOKUP_FOLLOW, &kpath)) {
+-        pr_info("sucompat: /data/adb/ksud not found, fallback to /system/bin/sh");
++    ret = kern_path(KSUD_PATH, LOOKUP_FOLLOW, &kpath);
++    if (ret) {
+         memcpy((void *)filename, sh_path, sizeof(sh_path));
+         goto out;
+     }
+@@ -412,7 +451,13 @@ int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int
+ 
+ #ifndef CONFIG_KSU_TRACEPOINT_HOOK
+     if (ksu_is_current_proc_unprivillege()) {
+-        return 0;
++        /*
++         * WSA app-spawned terminal shells inherit this optimization flag.
++         * Keep the fast rejection for everything except an exact virtual su
++         * path requested by an allowlisted UID while sucompat is enabled.
++         */
++        if (!ksu_sucompat_should_handle_path(filename))
++            return 0;
+     }
+ #endif
+ 
+@@ -499,7 +544,7 @@ int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *_
+     if (unlikely(IS_ERR(*filename) || (*filename)->name == NULL))
+         return 0;
+ 
+-    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path))))
++    if (likely(!is_su_path((*filename)->name)))
+         return 0;
+ 
+     old_cred = override_creds(ksu_cred);
+@@ -516,7 +561,7 @@ int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *_
+ #else
+ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags)
+ {
+-    char path[sizeof(su_path) + 1] = { 0 };
++    char path[sizeof(su_alt_path) + 1] = { 0 };
+     const struct cred *old_cred;
+ 
+ #ifndef CONFIG_KSU_TRACEPOINT_HOOK
+@@ -540,7 +585,7 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+ 
+     ksu_strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+ 
+-    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
++    if (unlikely(is_su_path(path))) {
+         old_cred = override_creds(ksu_cred);
+         if (is_ksud_exists()) {
+             pr_info("ksu_handle_faccessat su->sh!\n");
+@@ -577,7 +622,7 @@ int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
+         return 0;
+     }
+ 
+-    if (likely(memcmp((*filename)->name, su_path, sizeof(su_path)))) {
++    if (likely(!is_su_path((*filename)->name))) {
+         return 0;
+     }
+ 
+@@ -596,7 +641,7 @@ int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
+ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+ {
+     const struct cred *old_cred;
+-    char path[sizeof(su_path) + 1] = { 0 };
++    char path[sizeof(su_alt_path) + 1] = { 0 };
+ 
+ #ifndef CONFIG_KSU_TRACEPOINT_HOOK
+     if (ksu_is_current_proc_unprivillege()) {
+@@ -625,7 +670,7 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
+ 
+     ksu_strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+ 
+-    if (unlikely(!memcmp(path, su_path, sizeof(su_path)))) {
++    if (unlikely(is_su_path(path))) {
+         old_cred = override_creds(ksu_cred);
+         if (is_ksud_exists()) {
+             pr_info("ksu_handle_stat su->sh!\n");
+diff --git a/kernel/feature/sucompat.h b/kernel/feature/sucompat.h
+index 0c6365c0..3fd60301 100644
+--- a/kernel/feature/sucompat.h
++++ b/kernel/feature/sucompat.h
+@@ -13,6 +13,9 @@ extern bool ksu_su_compat_enabled;
+ void ksu_sucompat_init(void);
+ void ksu_sucompat_exit(void);
+ 
++/* Return a lookup-only replacement for an authorized virtual su path. */
++const char *ksu_sucompat_lookup_redirect(const char *path);
++
+ // Handler functions exported for hook_manager
+ #ifdef CONFIG_KSU_SUSFS
+ int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);
+diff --git a/kernel/runtime/ksud_integration.c b/kernel/runtime/ksud_integration.c
+index 2ddcf312..e93c9d18 100644
+--- a/kernel/runtime/ksud_integration.c
++++ b/kernel/runtime/ksud_integration.c
+@@ -269,9 +269,7 @@ void ksu_handle_execveat_ksud(const char *filename, struct user_arg_ptr *argv, s
+         if (!init_second_stage_executed && check_argv(*argv, 1, "second_stage", buf, sizeof(buf))) {
+             pr_info("/system/bin/init second_stage executed via argv1 check\n");
+             ksu_selinux_hide_handle_second_stage();
+-            apply_kernelsu_rules();
+-            cache_sid();
+-            setup_ksu_cred();
++            ksu_ensure_sepolicy();
+             init_second_stage_executed = true;
+         }
+     } else if (unlikely(!memcmp(filename, old_system_init, sizeof(old_system_init) - 1) && argv)) {
+@@ -288,9 +286,7 @@ void ksu_handle_execveat_ksud(const char *filename, struct user_arg_ptr *argv, s
+                 // But still init it to avoid we should handle more case
+                 ksu_selinux_hide_handle_second_stage();
+ 
+-                apply_kernelsu_rules();
+-                cache_sid();
+-                setup_ksu_cred();
++                ksu_ensure_sepolicy();
+                 init_second_stage_executed = true;
+             }
+         } else if (argc == 1 && !init_second_stage_executed && envp) {
+@@ -323,9 +319,7 @@ void ksu_handle_execveat_ksud(const char *filename, struct user_arg_ptr *argv, s
+                         // But still init it to avoid we should handle more case
+                         ksu_selinux_hide_handle_second_stage();
+ 
+-                        apply_kernelsu_rules();
+-                        cache_sid();
+-                        setup_ksu_cred();
++                        ksu_ensure_sepolicy();
+                         init_second_stage_executed = true;
+                         break;
+                     }
+@@ -719,6 +713,9 @@ void ksu_handle_initrc(struct file *file)
+         return;
+     }
+ 
++    /* Init is reading rc; install the KSU domain before injected ksud actions. */
++    ksu_ensure_sepolicy();
++
+     // we only process the first read
+     static bool rc_hooked = false;
+     if (rc_hooked) {
+diff --git a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
+index bf9ba1f6..45ea6afd 100644
+--- a/kernel/selinux/selinux.c
++++ b/kernel/selinux/selinux.c
+@@ -1,4 +1,6 @@
+ #include "linux/cred.h"
++#include "linux/mutex.h"
++#include "selinux.h"
+ #include "linux/sched.h"
+ #include "linux/security.h"
+ #include "linux/version.h"
+@@ -24,6 +26,15 @@ static u32 cached_zygote_sid __read_mostly = 0;
+ static u32 cached_init_sid __read_mostly = 0;
+ u32 ksu_file_sid __read_mostly = 0;
+ 
++/*
++ * Some Manual Hook kernels load KSU after init's second-stage exec.  In that
++ * case the normal boot-time policy setup is missed; initialize it once at
++ * the first requested transition to the KSU domain.
++ */
++static DEFINE_MUTEX(ksu_deferred_policy_lock);
++static bool ksu_deferred_policy_attempted;
++
++
+ #ifdef CONFIG_KSU_SUSFS
+ // only susfs need that
+ static u32 cached_zygote_next_sid __read_mostly = 0;
+@@ -59,14 +70,35 @@ static int transive_to_domain(const char *domain, struct cred *cred, bool clear_
+     return error;
+ }
+ 
++void ksu_ensure_sepolicy(void)
++{
++    mutex_lock(&ksu_deferred_policy_lock);
++    if (!ksu_deferred_policy_attempted) {
++        ksu_deferred_policy_attempted = true;
++        pr_warn("deferred KSU sepolicy initialization\n");
++        apply_kernelsu_rules();
++        cache_sid();
++        setup_ksu_cred();
++    }
++    mutex_unlock(&ksu_deferred_policy_lock);
++}
++
+ void setup_selinux(const char *domain, struct cred *cred)
+ {
+-    if (transive_to_domain(domain, cred, false)) {
+-        pr_err("transive domain failed.\n");
++    if (!transive_to_domain(domain, cred, false)) {
+         return;
+     }
+-}
+ 
++    if (!strcmp(domain, KERNEL_SU_CONTEXT)) {
++        ksu_ensure_sepolicy();
++        if (!transive_to_domain(domain, cred, false)) {
++            pr_info("deferred KSU sepolicy transition succeeded\n");
++            return;
++        }
++    }
++
++    pr_err("transive domain failed.\n");
++}
+ void setup_ksu_cred_selinux(void)
+ {
+     if (ksu_cred && transive_to_domain(KERNEL_SU_CONTEXT, ksu_cred, false)) {
+diff --git a/kernel/selinux/selinux.h b/kernel/selinux/selinux.h
+index 905c8f2f..83ee2666 100644
+--- a/kernel/selinux/selinux.h
++++ b/kernel/selinux/selinux.h
+@@ -45,6 +45,7 @@ static inline bool is_zygote_next(const struct cred *cred)
+ bool is_init(const struct cred *cred);
+ 
+ void apply_kernelsu_rules(void);
++void ksu_ensure_sepolicy(void);
+ 
+ int handle_sepolicy(void __user *user_data, u64 data_len);
+ 

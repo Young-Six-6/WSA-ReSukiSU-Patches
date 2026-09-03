@@ -1,0 +1,22 @@
+--- fs/exec.c
++++ fs/exec.c
+@@ -2041,6 +2041,9 @@
+ 	struct user_arg_ptr argv = { .ptr.native = __argv };
+ 	struct user_arg_ptr envp = { .ptr.native = __envp };
+ 
++#ifdef CONFIG_KSU_MANUAL_HOOK
++	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
++#endif
+ 	return do_execveat_common(fd, filename, argv, envp, flags);
+ }
+ 
+@@ -2076,6 +2079,9 @@
+ 		.is_compat = true,
+ 		.ptr.compat = __envp,
+ 	};
++#ifdef CONFIG_KSU_MANUAL_HOOK // 32-bit ksud and 32-on-64 support
++	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
++#endif
+ 	return do_execveat_common(fd, filename, argv, envp, flags);
+ }
+ #endif
