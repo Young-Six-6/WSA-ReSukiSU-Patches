@@ -6,15 +6,24 @@ on:
       arch:
         description: "Target architecture"
         required: true
+        default: x64
         type: choice
         options:
           - x64
           - arm64
+      include_susfs:
+        description: "Also build and publish the SUSFS variant"
+        required: true
+        default: true
+        type: boolean
       create_release:
-        description: "Create GitHub Release"
+        description: "Create one GitHub Release containing every selected variant"
         required: false
         default: false
         type: boolean
+
+permissions:
+  contents: write
 
 env:
   KERNEL_TAG: android-lts/latte-2/5.15.104.4
@@ -23,14 +32,26 @@ env:
   PATCH_DIR: 5.15.104
   KSU_REPO: ReSukiSU/ReSukiSU
   KSU_REF: 736d9fe8a66c18908e67cfaa4abf82c4326308aa
+  KSU_VERSION: "35107"
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_REF: bca0d2333c1a7d717e7278b019d7af7ba1d16005
+  SUSFS_VERSION: "2.3.0"
+  SUSFS_MODULE_REPO: https://github.com/sidex15/susfs4ksu-module.git
+  SUSFS_MODULE_REF: d30974d4d6356cba1c322f8826b5fd7df904a4b9
+  ANDROID_NDK_VERSION: 27.3.13750724
 
 jobs:
   build:
+    name: ${{ github.event.inputs.arch }}-${{ matrix.variant }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.include_susfs && '["standard","susfs"]' || '["standard"]') }}
 
     steps:
       - name: Checkout WSA kernel source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: microsoft/WSA-Linux-Kernel
           ref: ${{ env.KERNEL_TAG }}
@@ -38,8 +59,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             bc \
             bison \
             build-essential \
@@ -53,7 +74,10 @@ jobs:
             lld \
             llvm \
             curl \
-            git
+            file \
+            git \
+            python3 \
+            zip
 
       - name: Verify toolchain
         run: |
@@ -62,50 +86,93 @@ jobs:
           llvm-ar --version
           llvm-objdump --version
 
-      - name: Clone ReSukiSU patch repository
+      - name: Clone this patch repository
         run: |
-          git clone --depth=1 --branch ${{ env.PATCH_BRANCH }} \
-            https://github.com/${{ env.PATCH_REPO }}.git \
+          git clone --depth=1 --branch "${PATCH_BRANCH}" \
+            "https://github.com/${PATCH_REPO}.git" \
             ../patch-repo
 
-      - name: Validate & apply all kernel patches
+      - name: Validate and apply WSA kernel hooks
         run: |
-          set -e
-          PATCH_ABS_DIR="../patch-repo/${{ env.PATCH_DIR }}"
-
-          echo "===== Step 1: Dry-run all patches (no file changes) ====="
-          for patch_file in "$PATCH_ABS_DIR"/00*.patch; do
-            patch_name=$(basename "$patch_file")
-            echo "Validating: $patch_name"
-            if ! patch -p0 --dry-run --no-backup-if-mismatch -i "$patch_file"; then
-              echo "Error VALIDATION FAILED: $patch_name has conflicts / rejects"
-              exit 1
+          set -euo pipefail
+          patch_dir="../patch-repo/${PATCH_DIR}"
+          for patch_file in "${patch_dir}"/00*.patch; do
+            patch_name="$(basename "${patch_file}")"
+            if [ "${{ matrix.variant }}" = "susfs" ]; then
+              case "${patch_name}" in
+                0005-kernel-reboot.c.patch)
+                  echo "Skipping ${patch_name}; SUSFS supplies its own reboot hook"
+                  continue
+                  ;;
+                0007-fs-namei.c.patch)
+                  echo "Skipping ${patch_name}; the WSA SUSFS patch supplies the combined su lookup hook"
+                  continue
+                  ;;
+              esac
             fi
+            echo "Applying ${patch_name}"
+            patch --batch -p0 --dry-run --no-backup-if-mismatch -i "${patch_file}"
+            patch --batch -p0 --no-backup-if-mismatch -i "${patch_file}"
           done
 
-          echo ""
-          echo "===== Step 2: Apply all patches in order ====="
-          for patch_file in "$PATCH_ABS_DIR"/00*.patch; do
-            patch_name=$(basename "$patch_file")
-            echo "Applying: $patch_name"
-            patch -p0 --no-backup-if-mismatch -i "$patch_file"
-          done
-
-          echo ""
-          echo "All patches applied successfully, zero rejects"
-
-      - name: Integrate ReSukiSU
+      - name: Integrate pinned ReSukiSU
         run: |
-          curl -LSs https://raw.githubusercontent.com/${{ env.KSU_REPO }}/${{ env.KSU_REF }}/kernel/setup.sh | bash -s -- "${{ env.KSU_REF }}"
+          set -euo pipefail
+          curl -LSs \
+            "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh" \
+            | bash -s -- "${KSU_REF}"
+          test "$(git -C KernelSU rev-parse HEAD)" = "${KSU_REF}"
 
       - name: Apply WSA ReSukiSU compatibility patch
         run: |
-          PATCH_FILE="$(realpath "../patch-repo/${{ env.PATCH_DIR }}/resukisu/0001-wsa-manual-hook-compat.patch")"
-          patch --batch --directory=KernelSU -p1 --dry-run --no-backup-if-mismatch -i "$PATCH_FILE"
-          patch --batch --directory=KernelSU -p1 --no-backup-if-mismatch -i "$PATCH_FILE"
+          set -euo pipefail
+          patch_file="$(realpath "../patch-repo/${PATCH_DIR}/resukisu/0001-wsa-manual-hook-compat.patch")"
+          patch --batch --directory=KernelSU -p1 --dry-run \
+            --no-backup-if-mismatch -i "${patch_file}"
+          patch --batch --directory=KernelSU -p1 \
+            --no-backup-if-mismatch -i "${patch_file}"
+
+      - name: Fetch pinned SUSFS source
+        if: matrix.variant == 'susfs'
+        run: |
+          set -euo pipefail
+          git init ../susfs-source
+          git -C ../susfs-source remote add origin "${SUSFS_REPO}"
+          git -C ../susfs-source fetch --depth=1 origin "${SUSFS_REF}"
+          git -C ../susfs-source checkout --detach FETCH_HEAD
+          test "$(git -C ../susfs-source rev-parse HEAD)" = "${SUSFS_REF}"
+          test "$(git -C ../susfs-source branch --show-current)" = ""
+          grep -q "SUSFS_VERSION \"v${SUSFS_VERSION}\"" \
+            ../susfs-source/kernel_patches/include/linux/susfs.h
+
+      - name: Apply SUSFS and WSA compatibility patches
+        if: matrix.variant == 'susfs'
+        run: |
+          set -euo pipefail
+          susfs_source="$(realpath ../susfs-source)"
+          upstream_patch="${susfs_source}/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+
+          patch --batch -p1 --dry-run --no-backup-if-mismatch -i "${upstream_patch}"
+          patch --batch -p1 --no-backup-if-mismatch -i "${upstream_patch}"
+          install -m 0644 "${susfs_source}/kernel_patches/fs/susfs.c" fs/susfs.c
+          install -m 0644 "${susfs_source}/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
+          install -m 0644 "${susfs_source}/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
+
+          for patch_file in ../patch-repo/${PATCH_DIR}/susfs/00*.patch; do
+            echo "Applying $(basename "${patch_file}")"
+            git apply --check --unsafe-paths "${patch_file}"
+            git apply --unsafe-paths "${patch_file}"
+          done
+
+          if find . -name '*.rej' -print -quit | grep -q .; then
+            echo "SUSFS patch rejects were created"
+            find . -name '*.rej' -print
+            exit 1
+          fi
 
       - name: Configure kernel
         run: |
+          set -euo pipefail
           if [ "${{ github.event.inputs.arch }}" = "x64" ]; then
             cp configs/wsa/config-wsa-x64 .config
           else
@@ -120,59 +187,206 @@ jobs:
           scripts/config --disable KSU_TRACEPOINT_HOOK
           scripts/config --enable KALLSYMS_ALL
 
-          yes "" | make olddefconfig
+          if [ "${{ matrix.variant }}" = "susfs" ]; then
+            scripts/config --enable KSU_SUSFS
+            scripts/config --enable KSU_SUSFS_SUS_PATH
+            scripts/config --enable KSU_SUSFS_SUS_MOUNT
+            scripts/config --enable KSU_SUSFS_SUS_KSTAT
+            scripts/config --enable KSU_SUSFS_SPOOF_UNAME
+            scripts/config --enable KSU_SUSFS_ENABLE_LOG
+            scripts/config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            scripts/config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            scripts/config --enable KSU_SUSFS_OPEN_REDIRECT
+            scripts/config --enable KSU_SUSFS_SUS_MAP
+          else
+            scripts/config --disable KSU_SUSFS
+          fi
 
-      - name: Verify config
+          make olddefconfig
+
+      - name: Verify config and source revisions
         run: |
-          grep "^CONFIG_KSU" .config || true
-          grep "^CONFIG_KALLSYMS" .config || true
+          set -euo pipefail
+          grep '^CONFIG_KSU' .config || true
+          grep '^CONFIG_KALLSYMS' .config || true
+          test "$(git -C KernelSU rev-parse HEAD)" = "${KSU_REF}"
+          if [ "${{ matrix.variant }}" = "susfs" ]; then
+            expected_susfs_configs=(
+              CONFIG_KSU_SUSFS
+              CONFIG_KSU_SUSFS_SUS_PATH
+              CONFIG_KSU_SUSFS_SUS_MOUNT
+              CONFIG_KSU_SUSFS_SUS_KSTAT
+              CONFIG_KSU_SUSFS_SPOOF_UNAME
+              CONFIG_KSU_SUSFS_ENABLE_LOG
+              CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+              CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+              CONFIG_KSU_SUSFS_OPEN_REDIRECT
+              CONFIG_KSU_SUSFS_SUS_MAP
+            )
+            for option in "${expected_susfs_configs[@]}"; do
+              grep -qx "${option}=y" .config || {
+                echo "Required SUSFS option is missing: ${option}"
+                exit 1
+              }
+            done
+            grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h
+          else
+            ! grep -q '^CONFIG_KSU_SUSFS=y' .config
+          fi
+          git diff --check
+          git -C KernelSU diff --check
 
-      - name: Show source info
+      - name: Build kernel
         run: |
-          git log --oneline -1
-          make kernelversion
+          set +e
+          if [ "${{ github.event.inputs.arch }}" = "x64" ]; then
+            make -s -j"$(nproc)" LLVM=1 bzImage > /tmp/build.log 2>&1
+          else
+            make -s -j"$(nproc)" LLVM=1 \
+              ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image \
+              > /tmp/build.log 2>&1
+          fi
+          rc=$?
+          set -e
+          tail -n 100 /tmp/build.log
+          if [ "${rc}" -ne 0 ]; then
+            grep -n -E 'error:|warning:|undefined reference|FAILED' /tmp/build.log \
+              | tail -n 100 || true
+          fi
+          exit "${rc}"
 
-      - name: Build x64
-        if: github.event.inputs.arch == 'x64'
+      - name: Stage kernel artifact
         run: |
-          make -j$(nproc) LLVM=1 bzImage
+          set -euo pipefail
+          mkdir -p dist
+          suffix=""
+          if [ "${{ matrix.variant }}" = "susfs" ]; then
+            suffix="-SUSFS-${SUSFS_VERSION}"
+          fi
+          if [ "${{ github.event.inputs.arch }}" = "x64" ]; then
+            cp arch/x86/boot/bzImage \
+              "dist/WSA-5.15.104-ReSukiSU-${KSU_VERSION}${suffix}-x64-bzImage"
+          else
+            cp arch/arm64/boot/Image \
+              "dist/WSA-5.15.104-ReSukiSU-${KSU_VERSION}${suffix}-arm64-Image"
+          fi
 
-      - name: Build arm64
-        if: github.event.inputs.arch == 'arm64'
+      - name: Build WSA x64 SUSFS userspace helper
+        if: matrix.variant == 'susfs' && github.event.inputs.arch == 'x64'
         run: |
-          make -j$(nproc) LLVM=1 \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            Image
+          set -euo pipefail
+          ndk_dir="${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          if [ ! -x "${ndk_dir}/ndk-build" ]; then
+            sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+          fi
+          test -x "${ndk_dir}/ndk-build"
+          "${ndk_dir}/ndk-build" \
+            -C ../susfs-source/ksu_susfs \
+            APP_ABI=x86_64 \
+            APP_PLATFORM=android-29
+          helper=../susfs-source/ksu_susfs/libs/x86_64/ksu_susfs
+          test -x "${helper}"
+          file "${helper}"
+          readelf -h "${helper}" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
 
-      - name: Upload x64
-        if: github.event.inputs.arch == 'x64'
-        uses: actions/upload-artifact@v4
+      - name: Package WSA-compatible SUSFS module
+        if: matrix.variant == 'susfs'
+        run: |
+          set -euo pipefail
+          git init ../susfs-module
+          git -C ../susfs-module remote add origin "${SUSFS_MODULE_REPO}"
+          git -C ../susfs-module fetch --depth=1 origin "${SUSFS_MODULE_REF}"
+          git -C ../susfs-module checkout --detach FETCH_HEAD
+          test "$(git -C ../susfs-module rev-parse HEAD)" = "${SUSFS_MODULE_REF}"
+
+          prepare_args=(
+            --module-dir ../susfs-module
+            --arch "${{ github.event.inputs.arch }}"
+          )
+          if [ "${{ github.event.inputs.arch }}" = "x64" ]; then
+            prepare_args+=(
+              --native-tool ../susfs-source/ksu_susfs/libs/x86_64/ksu_susfs
+            )
+          fi
+          python3 ../patch-repo/scripts/prepare-wsa-susfs-module.py "${prepare_args[@]}"
+
+          required_module_files=(
+            module.prop
+            customize.sh
+            post-fs-data.sh
+            post-mount.sh
+            service.sh
+            boot-completed.sh
+            sepolicy.rule
+            config.sh
+            susfs_reset.sh
+            susfs-bin-check.sh
+            susfs-bin-update.sh
+            action.sh
+            webroot/index.html
+            tools/ksu_susfs_arm64
+          )
+          for file_path in "${required_module_files[@]}"; do
+            test -e "../susfs-module/${file_path}" || {
+              echo "Required SUSFS module component is missing: ${file_path}"
+              exit 1
+            }
+          done
+          grep -q 'wsa-webui-gpu-compat' ../susfs-module/webroot/index.html
+          if [ "${{ github.event.inputs.arch }}" = "x64" ]; then
+            test -x ../susfs-module/tools/ksu_susfs_x86_64
+            readelf -h ../susfs-module/tools/ksu_susfs_arm64 \
+              | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+            ! grep -q '^updateJson=' ../susfs-module/module.prop
+          fi
+
+          module_name="WSA-SUSFS-${SUSFS_VERSION}-Module-${{ github.event.inputs.arch }}.zip"
+          (
+            cd ../susfs-module
+            zip -q -r "${GITHUB_WORKSPACE}/dist/${module_name}" . \
+              -x '.git/*' '.github/*' '*.md'
+          )
+          unzip -t "dist/${module_name}"
+          unzip -l "dist/${module_name}" | tail -n 20
+
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum * > "SHA256SUMS-${{ github.event.inputs.arch }}-${{ matrix.variant }}.txt"
+          )
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
         with:
-          name: bzImage-5.15.104-x64-ReSukiSU
-          path: arch/x86/boot/bzImage
-
-      - name: Upload arm64
-        if: github.event.inputs.arch == 'arm64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Image-5.15.104-arm64-ReSukiSU
-          path: arch/arm64/boot/Image
+          name: WSA-5.15.104-${{ github.event.inputs.arch }}-${{ matrix.variant }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    if: github.event.inputs.create_release == 'true'
+    if: inputs.create_release
     needs: build
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download every selected variant
+        uses: actions/download-artifact@v8
         with:
           path: release
 
-      - uses: softprops/action-gh-release@v2
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: WSA-5.15.104-ReSukiSU-${{ github.run_number }}-${{ github.event.inputs.arch }}
           name: WSA Kernel 5.15.104 ReSukiSU (${{ github.event.inputs.arch }})
+          body: |
+            ReSukiSU: `${{ env.KSU_REF }}` (version code `${{ env.KSU_VERSION }}`)
+            SUSFS when selected: `${{ env.SUSFS_REF }}` (`v${{ env.SUSFS_VERSION }}`)
+
+            With **Also build and publish the SUSFS variant** enabled, this
+            release contains both the standard kernel and the SUSFS kernel.
+            The SUSFS job also supplies the matching WSA-compatible module.
           files: release/**/*
           generate_release_notes: true
         env:

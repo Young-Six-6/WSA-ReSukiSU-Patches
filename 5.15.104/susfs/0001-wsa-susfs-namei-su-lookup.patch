@@ -1,0 +1,42 @@
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2469,13 +2469,28 @@ static int path_lookupat(struct nameidata *nd, unsigned flags, struct path *path
+ 	return err;
+ }
+ 
++#if defined(CONFIG_KSU_MANUAL_HOOK) || defined(CONFIG_KSU_SUSFS)
++extern const char *ksu_sucompat_lookup_redirect(const char *path);
++#endif
++
+ int filename_lookup(int dfd, struct filename *name, unsigned flags,
+ 		    struct path *path, struct path *root)
+ {
+ 	int retval;
+ 	struct nameidata nd;
++#if defined(CONFIG_KSU_MANUAL_HOOK) || defined(CONFIG_KSU_SUSFS)
++	const char *ksu_original_name = NULL;
++	const char *ksu_redirect_name;
++#endif
+ 	if (IS_ERR(name))
+ 		return PTR_ERR(name);
++#if defined(CONFIG_KSU_MANUAL_HOOK) || defined(CONFIG_KSU_SUSFS)
++	ksu_redirect_name = ksu_sucompat_lookup_redirect(name->name);
++	if (ksu_redirect_name) {
++		ksu_original_name = name->name;
++		name->name = ksu_redirect_name;
++	}
++#endif
+ 	set_nameidata(&nd, dfd, name, root);
+ 	retval = path_lookupat(&nd, flags | LOOKUP_RCU, path);
+ 	if (unlikely(retval == -ECHILD))
+@@ -2483,6 +2498,10 @@ int filename_lookup(int dfd, struct filename *name, unsigned flags,
+ 	if (unlikely(retval == -ESTALE))
+ 		retval = path_lookupat(&nd, flags | LOOKUP_REVAL, path);
+ 
++#if defined(CONFIG_KSU_MANUAL_HOOK) || defined(CONFIG_KSU_SUSFS)
++	if (ksu_original_name)
++		name->name = ksu_original_name;
++#endif
+ 	if (likely(!retval))
+ 		audit_inode(name, path->dentry,
+ 			    flags & LOOKUP_MOUNTPOINT ? AUDIT_INODE_NOEVAL : 0);
