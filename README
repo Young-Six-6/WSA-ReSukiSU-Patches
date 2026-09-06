@@ -45,6 +45,8 @@ WSA 专用适配包括：
 
 - `/system/bin/su` 和 `/product/bin/su` 的虚拟路径查找与执行兼容；
 - 修复 WSA 终端运行时中的 `argv[0]`，确保 `ksud` 选择正确的 su applet；
+- 修复 ReSukiSU 旧版 GET_INFO ioctl 向 8 字节兼容缓冲区写入 12 字节的
+  ABI 越界，使 Hybrid Mount 等旧接口客户端不会在检测 KernelSU 时崩溃；
 - 适配 WSA 5.15 的 fanotify 回调 ABI；
 - 使用 `vm_end` 兼容 WSA 缺失 `VMA_PAD_START` 的内核树；
 - x64 使用原生 x86_64 `ksu_susfs`，避免 ARM64 工具经 Houdini 运行导致 WebUI

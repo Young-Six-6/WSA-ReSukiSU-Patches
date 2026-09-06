@@ -123,14 +123,17 @@ jobs:
             | bash -s -- "${KSU_REF}"
           test "$(git -C KernelSU rev-parse HEAD)" = "${KSU_REF}"
 
-      - name: Apply WSA ReSukiSU compatibility patch
+      - name: Apply WSA ReSukiSU compatibility patches
         run: |
           set -euo pipefail
-          patch_file="$(realpath "../patch-repo/${PATCH_DIR}/resukisu/0001-wsa-manual-hook-compat.patch")"
-          patch --batch --directory=KernelSU -p1 --dry-run \
-            --no-backup-if-mismatch -i "${patch_file}"
-          patch --batch --directory=KernelSU -p1 \
-            --no-backup-if-mismatch -i "${patch_file}"
+          patch_dir="$(realpath "../patch-repo/${PATCH_DIR}/resukisu")"
+          for patch_file in "${patch_dir}"/00*.patch; do
+            echo "Applying $(basename "${patch_file}")"
+            patch --batch --directory=KernelSU -p1 --dry-run \
+              --no-backup-if-mismatch -i "${patch_file}"
+            patch --batch --directory=KernelSU -p1 \
+              --no-backup-if-mismatch -i "${patch_file}"
+          done
 
       - name: Fetch pinned SUSFS source
         if: matrix.variant == 'susfs'
@@ -210,6 +213,8 @@ jobs:
           grep '^CONFIG_KSU' .config || true
           grep '^CONFIG_KALLSYMS' .config || true
           test "$(git -C KernelSU rev-parse HEAD)" = "${KSU_REF}"
+          grep -Fq 'sizeof(cmd.version) + sizeof(cmd.flags)' \
+            KernelSU/kernel/supercall/dispatch.c
           if [ "${{ matrix.variant }}" = "susfs" ]; then
             expected_susfs_configs=(
               CONFIG_KSU_SUSFS

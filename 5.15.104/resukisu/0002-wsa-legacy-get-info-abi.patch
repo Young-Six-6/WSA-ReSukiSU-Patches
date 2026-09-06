@@ -1,0 +1,21 @@
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -122,7 +122,16 @@ static int do_get_info_legacy(void __user *arg)
+         cmd.flags = ksuflags_override;
+ #endif
+ 
+-    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
++    /*
++     * The size-less legacy ioctl predates the features field.  Existing
++     * consumers, including Hybrid Mount's ksu crate, allocate only the
++     * version/flags prefix.  Copying the newer 12-byte structure here
++     * overwrites their userspace stack and can turn the feature count into
++     * a return address.  The size-tagged KSU_IOCTL_GET_INFO remains the
++     * complete interface for version, flags, features and UAPI version.
++     */
++    if (copy_to_user(arg, &cmd,
++                     sizeof(cmd.version) + sizeof(cmd.flags))) {
+         pr_err("get_version: copy_to_user failed\n");
+         return -EFAULT;
+     }
