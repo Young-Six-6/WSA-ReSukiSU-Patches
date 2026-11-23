@@ -112,8 +112,8 @@ def patch_webui(module_dir: Path) -> None:
 
     js_path, js = candidates[0]
     # R28 reports module version 1.5.2 although this WebUI gates these controls
-    # at 1.5.4/1.5.5/1.5.7. SUSFS 2.3.0 was tested with the userspace umount
-    # control and the non-su mount-hide supercall, so expose those two only.
+    # at 1.5.4/1.5.5/1.5.7. Keep the userspace auto-umount and non-su mount-hide
+    # controls available for the pinned SUSFS 2.4.x kernel interface.
     js = replace_once(js, "v(E,1,5,4)&&W(", "W(", "auto-hide initializer")
     js = replace_once(js, "v(n,1,5,7)?(", "!0?(", "non-su mount-hide gate")
     js = replace_once(

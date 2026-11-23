@@ -1,4 +1,4 @@
-name: Build WSA Kernel 5.15.104 (ReSukiSU)
+name: Build WSA Kernel 5.15.104 (BakaSU)
 
 on:
   workflow_dispatch:
@@ -30,14 +30,14 @@ env:
   PATCH_REPO: ${{ github.repository }}
   PATCH_BRANCH: ${{ github.ref_name }}
   PATCH_DIR: 5.15.104
-  KSU_REPO: ReSukiSU/ReSukiSU
-  KSU_REF: 736d9fe8a66c18908e67cfaa4abf82c4326308aa
-  KSU_VERSION: "35107"
+  KSU_REPO: Baka-SU/BakaSU
+  KSU_REF: bc8224d043fda63dd9ebce2f9caa5466610f7286
+  KSU_VERSION: "35283"
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
-  SUSFS_REF: bca0d2333c1a7d717e7278b019d7af7ba1d16005
-  SUSFS_VERSION: "2.3.0"
+  SUSFS_REF: c1d1da42b74771944207ec45aaceff9c57e84985
+  SUSFS_VERSION: "2.4.0"
   SUSFS_MODULE_REPO: https://github.com/sidex15/susfs4ksu-module.git
-  SUSFS_MODULE_REF: d30974d4d6356cba1c322f8826b5fd7df904a4b9
+  SUSFS_MODULE_REF: 44ed418e486bdad4a0edfc016dc72e69a6c1be91
   ANDROID_NDK_VERSION: 27.3.13750724
 
 jobs:
@@ -115,7 +115,7 @@ jobs:
             patch --batch -p0 --no-backup-if-mismatch -i "${patch_file}"
           done
 
-      - name: Integrate pinned ReSukiSU
+      - name: Integrate pinned BakaSU
         run: |
           set -euo pipefail
           curl -LSs \
@@ -123,10 +123,10 @@ jobs:
             | bash -s -- "${KSU_REF}"
           test "$(git -C KernelSU rev-parse HEAD)" = "${KSU_REF}"
 
-      - name: Apply WSA ReSukiSU compatibility patches
+      - name: Apply WSA BakaSU compatibility patches
         run: |
           set -euo pipefail
-          patch_dir="$(realpath "../patch-repo/${PATCH_DIR}/resukisu")"
+          patch_dir="$(realpath "../patch-repo/${PATCH_DIR}/bakasu")"
           for patch_file in "${patch_dir}"/00*.patch; do
             echo "Applying $(basename "${patch_file}")"
             patch --batch --directory=KernelSU -p1 --dry-run \
@@ -154,9 +154,12 @@ jobs:
           set -euo pipefail
           susfs_source="$(realpath ../susfs-source)"
           upstream_patch="${susfs_source}/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+          adapted_patch="${RUNNER_TEMP}/susfs-android13-5.15-wsa.patch"
 
-          patch --batch -p1 --dry-run --no-backup-if-mismatch -i "${upstream_patch}"
-          patch --batch -p1 --no-backup-if-mismatch -i "${upstream_patch}"
+          python3 ../patch-repo/scripts/adapt-susfs-patch-for-wsa.py \
+            "${upstream_patch}" "${adapted_patch}"
+          patch --batch -p1 --dry-run --no-backup-if-mismatch -i "${adapted_patch}"
+          patch --batch -p1 --no-backup-if-mismatch -i "${adapted_patch}"
           install -m 0644 "${susfs_source}/kernel_patches/fs/susfs.c" fs/susfs.c
           install -m 0644 "${susfs_source}/kernel_patches/include/linux/susfs.h" include/linux/susfs.h
           install -m 0644 "${susfs_source}/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
@@ -183,15 +186,13 @@ jobs:
           fi
 
           scripts/config --enable KSU
-          scripts/config --enable KSU_MANUAL_HOOK
-          scripts/config --enable KSU_MANUAL_HOOK_AUTO_SETUID_HOOK
-          scripts/config --enable KSU_MANUAL_HOOK_AUTO_INPUT_HOOK
-          scripts/config --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
-          scripts/config --disable KSU_TRACEPOINT_HOOK
           scripts/config --enable KALLSYMS_ALL
 
           if [ "${{ matrix.variant }}" = "susfs" ]; then
+            scripts/config --disable KSU_MANUAL_HOOK
+            scripts/config --disable KSU_TRACEPOINT_HOOK
             scripts/config --enable KSU_SUSFS
+            scripts/config --enable KSU_SUSFS_PRIORITY_UID_FILTER
             scripts/config --enable KSU_SUSFS_SUS_PATH
             scripts/config --enable KSU_SUSFS_SUS_MOUNT
             scripts/config --enable KSU_SUSFS_SUS_KSTAT
@@ -202,6 +203,11 @@ jobs:
             scripts/config --enable KSU_SUSFS_OPEN_REDIRECT
             scripts/config --enable KSU_SUSFS_SUS_MAP
           else
+            scripts/config --enable KSU_MANUAL_HOOK
+            scripts/config --enable KSU_MANUAL_HOOK_AUTO_SETUID_HOOK
+            scripts/config --enable KSU_MANUAL_HOOK_AUTO_INPUT_HOOK
+            scripts/config --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
+            scripts/config --disable KSU_TRACEPOINT_HOOK
             scripts/config --disable KSU_SUSFS
           fi
 
@@ -213,11 +219,14 @@ jobs:
           grep '^CONFIG_KSU' .config || true
           grep '^CONFIG_KALLSYMS' .config || true
           test "$(git -C KernelSU rev-parse HEAD)" = "${KSU_REF}"
+          ksu_version_code=$((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))
+          test "${ksu_version_code}" = "${KSU_VERSION}"
           grep -Fq 'sizeof(cmd.version) + sizeof(cmd.flags)' \
             KernelSU/kernel/supercall/dispatch.c
           if [ "${{ matrix.variant }}" = "susfs" ]; then
             expected_susfs_configs=(
               CONFIG_KSU_SUSFS
+              CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER
               CONFIG_KSU_SUSFS_SUS_PATH
               CONFIG_KSU_SUSFS_SUS_MOUNT
               CONFIG_KSU_SUSFS_SUS_KSTAT
@@ -234,9 +243,13 @@ jobs:
                 exit 1
               }
             done
-            grep -q '#define SUSFS_VERSION "v2.3.0"' include/linux/susfs.h
+            ! grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' .config
+            ! grep -qx 'CONFIG_KSU_TRACEPOINT_HOOK=y' .config
+            grep -q '#define SUSFS_VERSION "v2.4.0"' include/linux/susfs.h
           else
             ! grep -q '^CONFIG_KSU_SUSFS=y' .config
+            grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' .config
+            ! grep -qx 'CONFIG_KSU_TRACEPOINT_HOOK=y' .config
           fi
           git diff --check
           git -C KernelSU diff --check
@@ -270,10 +283,10 @@ jobs:
           fi
           if [ "${{ github.event.inputs.arch }}" = "x64" ]; then
             cp arch/x86/boot/bzImage \
-              "dist/WSA-5.15.104-ReSukiSU-${KSU_VERSION}${suffix}-x64-bzImage"
+              "dist/WSA-5.15.104-BakaSU-${KSU_VERSION}${suffix}-x64-bzImage"
           else
             cp arch/arm64/boot/Image \
-              "dist/WSA-5.15.104-ReSukiSU-${KSU_VERSION}${suffix}-arm64-Image"
+              "dist/WSA-5.15.104-BakaSU-${KSU_VERSION}${suffix}-arm64-Image"
           fi
 
       - name: Build WSA x64 SUSFS userspace helper
@@ -383,10 +396,10 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: WSA-5.15.104-ReSukiSU-${{ github.run_number }}-${{ github.event.inputs.arch }}
-          name: WSA Kernel 5.15.104 ReSukiSU (${{ github.event.inputs.arch }})
+          tag_name: WSA-5.15.104-BakaSU-${{ github.run_number }}-${{ github.event.inputs.arch }}
+          name: WSA Kernel 5.15.104 BakaSU (${{ github.event.inputs.arch }})
           body: |
-            ReSukiSU: `${{ env.KSU_REF }}` (version code `${{ env.KSU_VERSION }}`)
+            BakaSU: `${{ env.KSU_REF }}` (version code `${{ env.KSU_VERSION }}`)
             SUSFS when selected: `${{ env.SUSFS_REF }}` (`v${{ env.SUSFS_VERSION }}`)
 
             With **Also build and publish the SUSFS variant** enabled, this

@@ -1,16 +1,11 @@
-# WSA SUSFS compatibility layer
+# WSA SUSFS compatibility patches
 
-These patches are applied after the pinned upstream SUSFS Android 13 / Linux
-5.15 kernel patch. They reproduce the source used by the tested WSA x86_64
-kernel.
+Applied after the pinned SUSFS Android 13 / Linux 5.15 patch and the BakaSU compatibility patch.
 
-- Keep virtual `/system/bin/su` and `/product/bin/su` reachable for authorized
-  applications after SUSFS marks their process as `no_su`.
-- Restore `argv[0]` to `su` before handing execution to `ksud`.
-- Retain the WSA lookup-only virtual-su redirect when SUSFS is enabled.
+- Rebase two upstream include hunks that expect Android trace-hook headers absent from WSA; the adapter preserves the upstream patch body and supplies the equivalent SUSFS declarations for the WSA tree.
+- Keep authorized virtual su path lookups working with the SUSFS no-su process flag.
+- Preserve the WSA no-su exception in the SUSFS exec path.
 - Adapt the upstream fanotify callback to the WSA 5.15 ABI.
-- Use `vm_end` because this WSA tree has no `VMA_PAD_START` helper.
+- Use vm_end because the WSA tree has no VMA_PAD_START helper.
 
-Upstream SUSFS source is pinned by the workflow; the upstream KernelSU patch is
-not applied because the pinned ReSukiSU revision already contains that
-integration.
+The sucompat path matcher, public path-check helpers, alternate /product/bin/su path, and argv[0] rewrite live in the shared BakaSU patch. This directory contains only kernel-tree changes required by the SUSFS variant.
