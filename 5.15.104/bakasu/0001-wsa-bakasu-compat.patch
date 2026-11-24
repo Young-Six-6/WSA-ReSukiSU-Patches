@@ -263,20 +263,24 @@ index 93573422..8163ab1f 100644
  #ifdef CONFIG_KSU_SUSFS
  int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);
 diff --git a/kernel/runtime/ksud_integration.c b/kernel/runtime/ksud_integration.c
-index aaf79ea7..82edb977 100644
+index aaf79ea7..f009d551 100644
 --- a/kernel/runtime/ksud_integration.c
 +++ b/kernel/runtime/ksud_integration.c
-@@ -258,9 +258,7 @@ void ksu_handle_execveat_ksud(char *filename, struct user_arg_ptr *argv, struct
+@@ -258,11 +258,9 @@ void ksu_handle_execveat_ksud(char *filename, struct user_arg_ptr *argv, struct
              pr_info("/system/bin/init second_stage executed via argv1 check\n");
              ksu_preinit_release();
              ksu_selinux_hide_handle_second_stage();
 -            apply_kernelsu_rules();
 -            cache_sid();
 -            setup_ksu_cred();
-+            ksu_ensure_sepolicy();
-             // after apply_kernelsu_rules, so that selinux_hide has its sepolicy backup
-             ksu_feature_apply_forced();
+-            // after apply_kernelsu_rules, so that selinux_hide has its sepolicy backup
+-            ksu_feature_apply_forced();
++            // Apply forced features after the KSU policy is installed.
++            if (ksu_ensure_sepolicy())
++                ksu_feature_apply_forced();
              init_second_stage_executed = true;
+         }
+     } else if (unlikely(!memcmp(filename, old_system_init, sizeof(old_system_init) - 1) && argv)) {
 @@ -279,9 +277,7 @@ void ksu_handle_execveat_ksud(char *filename, struct user_arg_ptr *argv, struct
                  // But still init it to avoid we should handle more case
                  ksu_selinux_hide_handle_second_stage();
@@ -299,57 +303,166 @@ index aaf79ea7..82edb977 100644
                          init_second_stage_executed = true;
                          break;
                      }
-@@ -703,6 +697,10 @@ void ksu_handle_initrc(struct file *file)
+@@ -713,6 +707,10 @@ void ksu_handle_initrc(struct file *file)
          return;
      }
  
-+    /* Init reads rc after loading SELinux policy; recover if its second-stage
-+     * exec was missed by the manual-hook path. */
-+    ksu_ensure_sepolicy();
++    /* A real init.rc read can recover a missed second-stage exec. */
++    if (!ksu_ensure_sepolicy())
++        return;
 +
-     if (ksu_init_rc_hook_inactive())
-         return;
+     // we only process the first read
+     static bool rc_hooked = false;
+     if (rc_hooked) {
+diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+index 12004345..f281252e 100644
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -151,10 +151,11 @@ static inline void ksu_unlock_sepolicy_legacy(void)
  
+ #endif // KSU_COMPAT_HAS_POLICY_MUTEX
+ 
+-void apply_kernelsu_rules()
++bool apply_kernelsu_rules(void)
+ {
+     struct ksu_original_symbols *symbols;
+     struct policydb *db;
++    bool applied = false;
+ 
+     if (!getenforce()) {
+         pr_info("SELinux permissive or disabled, apply rules!\n");
+@@ -164,28 +165,9 @@ void apply_kernelsu_rules()
+     struct selinux_policy *pol, *old_pol;
+     mutex_lock(&selinux_state.policy_mutex);
+     old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
+-    backup_sepolicy = ksu_dup_sepolicy(old_pol);
+-    if (IS_ERR(backup_sepolicy)) {
+-        pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
+-        backup_sepolicy = NULL;
+-    } else {
+-        backup_sepolicy->sidtab = kzalloc(sizeof(*backup_sepolicy->sidtab), GFP_KERNEL);
+-        if (!backup_sepolicy->sidtab) {
+-            pr_err("failed to alloc backup sidtab\n");
+-            ksu_destroy_sepolicy(backup_sepolicy);
+-            backup_sepolicy = NULL;
+-        } else {
+-            int ret = policydb_load_isids(&backup_sepolicy->policydb, backup_sepolicy->sidtab);
+-            if (ret) {
+-                pr_err("failed to load isids for backup sepolicy: %d!\n", ret);
+-                kfree(backup_sepolicy->sidtab);
+-                ksu_destroy_sepolicy(backup_sepolicy);
+-                backup_sepolicy = NULL;
+-            } else {
+-                pr_info("backup sepolicy success! latest_granting=%d\n", backup_sepolicy->latest_granting);
+-            }
+-        }
+-    }
++    if (!selinux_initialized(&selinux_state) || !old_pol)
++        goto out_unlock;
++
+     pol = ksu_dup_sepolicy(old_pol);
+     if (IS_ERR(pol)) {
+         pr_err("failed to dup selinux_policy: %ld\n", PTR_ERR(pol));
+@@ -261,6 +243,29 @@ retry:
+         ksu_destroy_sepolicy(pol);
+         goto out_unlock;
+     }
++
++    backup_sepolicy = ksu_dup_sepolicy(old_pol);
++    if (IS_ERR(backup_sepolicy)) {
++        pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
++        backup_sepolicy = NULL;
++    } else {
++        backup_sepolicy->sidtab = kzalloc(sizeof(*backup_sepolicy->sidtab), GFP_KERNEL);
++        if (!backup_sepolicy->sidtab) {
++            pr_err("failed to alloc backup sidtab\n");
++            ksu_destroy_sepolicy(backup_sepolicy);
++            backup_sepolicy = NULL;
++        } else {
++            int ret = policydb_load_isids(&backup_sepolicy->policydb, backup_sepolicy->sidtab);
++            if (ret) {
++                pr_err("failed to load isids for backup sepolicy: %d!\n", ret);
++                kfree(backup_sepolicy->sidtab);
++                ksu_destroy_sepolicy(backup_sepolicy);
++                backup_sepolicy = NULL;
++            } else {
++                pr_info("backup sepolicy success! latest_granting=%d\n", backup_sepolicy->latest_granting);
++            }
++        }
++    }
+ #endif
+ 
+     ksu_type(db, KERNEL_SU_DOMAIN, "domain");
+@@ -349,6 +354,7 @@ retry:
+     ksu_destroy_sepolicy(old_pol);
+ 
+     reset_avc_cache(seqno);
++    applied = true;
+ out_unlock:
+     mutex_unlock(&selinux_state.policy_mutex);
+ #else
+@@ -396,12 +402,14 @@ out_unlock:
+ 
+     /* Free the old policydb. */
+     ksu_destroy_policydb(oldpolicydb);
++    applied = true;
+ 
+ out_free:
+     /* Free buffer */
+     kfree(oldpolicydb);
+     ksu_unlock_sel_mutex_legacy();
+ #endif // !(LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_POLICY_MUTEX))
++    return applied;
+ }
+ 
+ #define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
 diff --git a/kernel/selinux/selinux.c b/kernel/selinux/selinux.c
-index b219c9cf..6d13509c 100644
+index b219c9cf..628dc323 100644
 --- a/kernel/selinux/selinux.c
 +++ b/kernel/selinux/selinux.c
-@@ -1,7 +1,9 @@
+@@ -1,7 +1,10 @@
  #include "linux/cred.h"
 +#include "linux/mutex.h"
  #include "linux/sched.h"
  #include "linux/security.h"
  #include "linux/version.h"
++#include "security.h"
 +#include "selinux.h"
  #include "selinux_defs.h"
  #include "klog.h" // IWYU pragma: keep
  #include "ksu.h"
-@@ -25,6 +27,10 @@ static u32 cached_init_sid __read_mostly = 0;
+@@ -25,6 +28,10 @@ static u32 cached_init_sid __read_mostly = 0;
  static u32 cached_adbd_sid __read_mostly = 0;
  u32 ksu_file_sid __read_mostly = 0;
  
 +/* Manual-hook WSA kernels can miss init's second-stage exec. */
 +static DEFINE_MUTEX(ksu_deferred_policy_lock);
-+static bool ksu_deferred_policy_attempted;
++static bool ksu_deferred_policy_applied;
 +
  #ifdef CONFIG_KSU_SUSFS
  // only susfs need that
  static u32 cached_zygote_next_sid __read_mostly = 0;
-@@ -60,12 +66,36 @@ static int transive_to_domain(const char *domain, struct cred *cred, bool clear_
+@@ -60,12 +67,41 @@ static int transive_to_domain(const char *domain, struct cred *cred, bool clear_
      return error;
  }
  
-+void ksu_ensure_sepolicy(void)
++bool ksu_ensure_sepolicy(void)
 +{
++    bool applied;
++
++    if (!selinux_initialized(&selinux_state))
++        return false;
++
 +    mutex_lock(&ksu_deferred_policy_lock);
-+    if (!ksu_deferred_policy_attempted) {
-+        ksu_deferred_policy_attempted = true;
-+        pr_warn("deferred KSU sepolicy initialization\n");
-+        apply_kernelsu_rules();
++    if (!ksu_deferred_policy_applied && apply_kernelsu_rules()) {
 +        cache_sid();
 +        setup_ksu_cred();
++        ksu_deferred_policy_applied = true;
 +    }
++    applied = ksu_deferred_policy_applied;
 +    mutex_unlock(&ksu_deferred_policy_lock);
++
++    return applied;
 +}
 +
  void setup_selinux(const char *domain, struct cred *cred)
@@ -361,8 +474,7 @@ index b219c9cf..6d13509c 100644
 +    if (!error)
          return;
 +
-+    if (!strcmp(domain, KERNEL_SU_CONTEXT)) {
-+        ksu_ensure_sepolicy();
++    if (!strcmp(domain, KERNEL_SU_CONTEXT) && ksu_ensure_sepolicy()) {
 +        error = transive_to_domain(domain, cred, false);
 +        if (!error) {
 +            pr_info("deferred KSU sepolicy transition succeeded\n");
@@ -375,14 +487,16 @@ index b219c9cf..6d13509c 100644
  
  void setup_ksu_cred_selinux(void)
 diff --git a/kernel/selinux/selinux.h b/kernel/selinux/selinux.h
-index 8f74a724..756dfa46 100644
+index 8f74a724..fb965310 100644
 --- a/kernel/selinux/selinux.h
 +++ b/kernel/selinux/selinux.h
-@@ -48,6 +48,7 @@ bool is_init(const struct cred *cred);
+@@ -47,7 +47,8 @@ bool is_init(const struct cred *cred);
+ 
  bool is_adbd(const struct cred *cred);
  
- void apply_kernelsu_rules(void);
-+void ksu_ensure_sepolicy(void);
+-void apply_kernelsu_rules(void);
++bool apply_kernelsu_rules(void);
++bool ksu_ensure_sepolicy(void);
  
  int handle_sepolicy(void __user *user_data, u64 data_len);
  
